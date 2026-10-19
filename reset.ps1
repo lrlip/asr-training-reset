@@ -6,10 +6,10 @@
 .DESCRIPTION
   1. Asks which sessions to reset, which is also the confirmation; -Session skips the question and
      -Force the confirmation
-  2. Stops every running Node.js and Bun process, also when only one session is reset, so they
-     release the session folders
-  3. Per session: removes the existing folder, clones the repository again from GitHub and runs its
-     setup.ps1
+  2. Per session: stops the processes that use its folder, removes the folder, clones the
+     repository again from GitHub and runs its setup.ps1. When the folder stays locked, it stops
+     every Node.js, Bun, Python, uv and VS Code process, also those of the other sessions, and
+     tries again
 
   The sessions go on the desktop, next to this launcher, or in C:\training when the desktop cannot
   be written to. Never inside this launcher: the session setups refuse to run inside another git
@@ -40,7 +40,8 @@ $script:Sessions = @(
     @{ Name = 'asr-session-1'; Repository = 'https://github.com/AlexDM0/asr-session-1.git' },
     @{ Name = 'asr-session-2'; Repository = 'https://github.com/AlexDM0/asr-session-2.git' }
 )
-$script:ProcessesToStop = @('node', 'bun')
+# The last resort when a session folder stays locked; names without .exe.
+$script:ProcessesToStop = @('node', 'bun', 'python', 'uv', 'Code')
 # The reset buttons on the desktop: shortcut name and the file next to this script it starts.
 $script:Shortcuts = @(
     @{ Name = 'Reset ASR session 1'; Target = 'reset1.cmd'; Description = 'Removes asr-session-1, clones it again and sets it up' },
@@ -145,16 +146,76 @@ function Install-DesktopShortcuts {
     }
 }
 
-function Stop-TrainingProcesses {
-    $runningProcesses = @(Get-Process -Name $script:ProcessesToStop -ErrorAction SilentlyContinue)
-    if ($runningProcesses.Count -eq 0) {
-        Write-Ok 'No Node.js or Bun processes are running.'
-        return
+# Every process, from one snapshot, with its executable path and command line together in Text.
+# Empty when Windows does not hand out the list.
+function Get-ProcessSnapshot {
+    $processSnapshot = @()
+    foreach ($process in @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue)) {
+        $processSnapshot += [pscustomobject]@{
+            Id       = [int]$process.ProcessId
+            ParentId = [int]$process.ParentProcessId
+            Name     = [string]$process.Name
+            Text     = "$($process.ExecutablePath) $($process.CommandLine)"
+        }
     }
-    Write-Info "Stopping $($runningProcesses.Count) Node.js and Bun process(es)..."
-    $runningProcesses | Stop-Process -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 1
-    Write-Ok 'Stopped the running Node.js and Bun processes.'
+    return ,$processSnapshot
+}
+
+# This script and the windows that started it, which must keep running.
+function Get-OwnProcessIds($processSnapshot) {
+    $ownProcessIds = @($PID)
+    $currentId = $PID
+    for ($depth = 0; $depth -lt 16; $depth++) {
+        $currentProcess = $processSnapshot | Where-Object { $_.Id -eq $currentId } | Select-Object -First 1
+        if (-not $currentProcess -or $currentProcess.ParentId -le 0 -or $ownProcessIds -contains $currentProcess.ParentId) { break }
+        $currentId = $currentProcess.ParentId
+        $ownProcessIds += $currentId
+    }
+    return ,$ownProcessIds
+}
+
+# Stops the given processes and everything they started, such as the terminals and servers of a
+# VS Code window, but never this script or the windows that started it. Returns how many it stopped.
+function Stop-ProcessTree($processSnapshot, $processIds) {
+    $treeIds = @($processIds)
+    $addedIds = @($processIds)
+    while ($addedIds.Count -gt 0) {
+        $addedIds = @($processSnapshot | Where-Object { $addedIds -contains $_.ParentId -and $treeIds -notcontains $_.Id } | ForEach-Object { $_.Id })
+        $treeIds += $addedIds
+    }
+    $ownProcessIds = Get-OwnProcessIds $processSnapshot
+    $stopIds = @($treeIds | Where-Object { $ownProcessIds -notcontains $_ })
+    foreach ($stopId in $stopIds) { Stop-Process -Id $stopId -Force -ErrorAction SilentlyContinue }
+    if ($stopIds.Count -gt 0) { Start-Sleep -Seconds 2 }
+    return $stopIds.Count
+}
+
+# Stops every process that runs from the session folder or names it on its command line, with
+# everything it started: node, bun or python from the folder, VS Code opened on it. Windows does not
+# tell which folder a terminal is in, so a terminal that was only opened there keeps running.
+function Stop-SessionProcesses($sessionFolder) {
+    $processSnapshot = Get-ProcessSnapshot
+    # The folder with \ or / as separator, followed by a separator, a quote, a space or the end, so
+    # asr-session-1 does not also match asr-session-10. -match ignores case, like Windows paths.
+    $escapedFolder = ($sessionFolder.TrimEnd('\', '/') -replace '([\\.\[\]\(\)\{\}\^\$\|\?\*\+])', '\$1') -replace '\\\\', '[\\/]'
+    $folderPattern = $escapedFolder + '([\\/"'' ]|$)'
+    $matchingIds = @($processSnapshot | Where-Object { $_.Text -match $folderPattern } | ForEach-Object { $_.Id })
+    $stoppedCount = Stop-ProcessTree $processSnapshot $matchingIds
+    if ($stoppedCount -gt 0) {
+        Write-Ok "Stopped $stoppedCount process(es) that used $sessionFolder."
+    } else {
+        Write-Ok "No running process uses $sessionFolder."
+    }
+}
+
+# The last resort when the folder stays locked: every Node.js, Bun, Python, uv and VS Code process
+# with everything it started, also those of the other sessions.
+function Stop-TrainingProcesses {
+    $processSnapshot = Get-ProcessSnapshot
+    $processNames = @($script:ProcessesToStop | ForEach-Object { "$_.exe" })
+    $matchingIds = @($processSnapshot | Where-Object { $processNames -contains $_.Name } | ForEach-Object { $_.Id })
+    $stoppedCount = Stop-ProcessTree $processSnapshot $matchingIds
+    Write-Warn "Stopped $stoppedCount Node.js, Bun, Python, uv and VS Code process(es), also those of other sessions."
 }
 
 # Turns -Session values like 1, asr-session-2, "1,2" or all into sessions. Returns $null for an unknown one.
@@ -206,10 +267,15 @@ function Reset-Session($session) {
     Write-Step $session.Name
 
     if (Test-Path -LiteralPath $sessionFolder) {
+        Stop-SessionProcesses $sessionFolder
         Write-Info "Removing $sessionFolder..."
         if (-not (Remove-SessionFolder $sessionFolder)) {
-            Write-ErrorMessage "Could not remove $sessionFolder. Close VS Code, terminals and Explorer windows in that folder, then press the reset button again."
-            return $false
+            Write-Warn "Something still uses $sessionFolder."
+            Stop-TrainingProcesses
+            if (-not (Remove-SessionFolder $sessionFolder)) {
+                Write-ErrorMessage "Could not remove $sessionFolder. Close the terminals and Explorer windows in that folder, then press the reset button again."
+                return $false
+            }
         }
         Write-Ok "Removed $sessionFolder."
     }
@@ -273,7 +339,7 @@ function Invoke-Reset {
     }
     Write-Bold "Resetting $sessionNames in $script:TrainingFolder"
 
-    # --- 2. Checks and processes -----------------------------------------------
+    # --- 2. Checks --------------------------------------------------------------
     Write-Step 'Checks'
     if (-not (Test-CommandExists 'git')) {
         Write-ErrorMessage 'git was not found. Install it from https://git-scm.com and press the reset button again.'
@@ -281,7 +347,6 @@ function Invoke-Reset {
     }
     Write-Ok "$(& git --version) works."
     Initialize-SystemProxy
-    Stop-TrainingProcesses
 
     # --- 3. Sessions -----------------------------------------------------------
     # Every session gets its turn, so one failing session does not block the other.
