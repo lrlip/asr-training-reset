@@ -16,10 +16,15 @@ Each button:
    files from the next one
 2. Starts right away: the buttons do not ask for confirmation. `reset.cmd` asks which session to
    reset, and that answer is the confirmation
-3. Per session: stops the processes that use its folder (node, bun or python running from it, VS
+3. Removes the chat history on the laptop, also when only one session is reset: the Copilot chats
+   of every folder and outside one, agent sessions, Copilot's memories and the Copilot CLI
+   sessions. It closes VS Code and Copilot CLI for that. Settings, extensions and the GitHub
+   sign-in stay. Cleaning the chat list in VS Code's own database needs Python, which the session
+   setups install
+4. Per session: stops the processes that use its folder (node, bun or python running from it, VS
    Code opened on it, and everything they started), removes the folder, clones it again from GitHub
    and runs its `setup.ps1`
-4. When a folder stays locked: stops every Node.js, Bun, Python, uv and VS Code process, also those
+5. When a folder stays locked: stops every Node.js, Bun, Python, uv and VS Code process, also those
    of the other session, and tries again. A terminal or Explorer window that is only open in the
    folder cannot be found that way; close it and press the button again
 
@@ -62,8 +67,8 @@ shortcuts are the buttons. Between two groups: press the one for the session to 
 without asking, in a small window, and the window closes by itself 5 seconds after the session is
 ready. When something goes wrong, the window stays open with the messages.
 
-Resetting deletes all work in the chosen session folders. It does not sign anyone out of GitHub, VS Code
-or Copilot, and does not change the git name and email.
+Resetting deletes all work in the chosen session folders and every chat on the laptop. It does not
+sign anyone out of GitHub, VS Code or Copilot, and does not change the git name and email.
 
 Options, from a PowerShell window in this folder:
 

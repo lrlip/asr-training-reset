@@ -6,7 +6,9 @@
 .DESCRIPTION
   1. Asks which sessions to reset, which is also the confirmation; -Session skips the question and
      -Force the confirmation
-  2. Per session: stops the processes that use its folder, removes the folder, clones the
+  2. Removes the chat history of VS Code and Copilot CLI, for every session and outside them, and
+     stops VS Code and Copilot CLI for it. Settings, extensions and the GitHub sign-in stay
+  3. Per session: stops the processes that use its folder, removes the folder, clones the
      repository again from GitHub and runs its setup.ps1. When the folder stays locked, it stops
      every Node.js, Bun, Python, uv and VS Code process, also those of the other sessions, and
      tries again
@@ -55,6 +57,29 @@ $script:FallbackTrainingFolder = 'C:\training'
 $script:WindowWidth = 100
 $script:WindowHeight = 25
 # AppLocker and WDAC run scripts from a user folder in ConstrainedLanguage, where .NET calls fail.
+# Chat history that every reset removes, so the next group starts without the chats of the last one.
+# The VS Code products whose user data holds chats.
+$script:VsCodeProducts = @('Code', 'Code - Insiders')
+# Under globalStorage: chats outside a workspace, agent sessions, and Copilot's sessions and memories.
+$script:VsCodeGlobalChatPaths = @(
+    'emptyWindowChatSessions', 'transferredChatSessions',
+    'agent-host.db', 'agent-host.db-shm', 'agent-host.db-wal', 'agent-host-storage.json',
+    'github.copilot-chat\session-store.db', 'github.copilot-chat\session-store.db-shm', 'github.copilot-chat\session-store.db-wal',
+    'github.copilot-chat\memory-tool', 'github.copilot-chat\copilot-cli-images'
+)
+# Keys in globalStorage\state.vscdb that list or cache chats, as SQL LIKE patterns. The rest of that
+# database stays: it also holds the GitHub sign-in.
+$script:VsCodeChatStateKeys = @(
+    'chat.ChatSessionStore.%', 'localAgentHost.cachedSessions%', 'agentSessions.%', 'inlineChat.history',
+    'inline-chat-history', 'chat.thinkingTitleCache', 'sessions.changesStatsCache', 'memento/interactive-session%'
+)
+# Under the Copilot CLI folder: its sessions, prompt history and logs. config.json and settings.json
+# stay, so nobody has to sign in again.
+$script:CopilotCliChatPaths = @(
+    'session-state', 'chats', 'sidebar-sessions-state', 'logs',
+    'session-store.db', 'session-store.db-shm', 'session-store.db-wal',
+    'command-history-state.json', 'open-sessions-state.json'
+)
 $script:IsFullLanguage = ($ExecutionContext.SessionState.LanguageMode -eq 'FullLanguage')
 $script:ResetExitCode = 0
 
@@ -252,6 +277,93 @@ function Stop-TrainingProcesses {
     Write-Warn "Stopped $stoppedCount Node.js, Bun, Python, uv and VS Code process(es), also those of other sessions."
 }
 
+# Stops VS Code and Copilot CLI with everything they started, so they release their chat files.
+function Stop-ChatProcesses {
+    $processSnapshot = Get-ProcessSnapshot
+    $processNames = @($script:VsCodeProducts | ForEach-Object { "$_.exe" }) + @('copilot.exe')
+    $matchingIds = @($processSnapshot | Where-Object { $processNames -contains $_.Name -or $_.Text -match '[\\/]@github[\\/]copilot[\\/]' } | ForEach-Object { $_.Id })
+    $stoppedCount = Stop-ProcessTree $processSnapshot $matchingIds
+    if ($stoppedCount -gt 0) { Write-Ok "Stopped VS Code and Copilot CLI ($stoppedCount process(es))." }
+}
+
+# Removes a file or folder. Returns whether it is gone.
+function Remove-ChatPath($path) {
+    if (-not (Test-Path -LiteralPath $path)) { return $true }
+    Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+    return (-not (Test-Path -LiteralPath $path))
+}
+
+# A python.exe that can open SQLite: the one the session setups install through uv, else one on the
+# PATH. Never the Microsoft Store stub, which only says that Python was not found. $null when none.
+function Get-PythonForSqlite {
+    $candidates = @(Join-Path (Join-Path (Join-Path $env:USERPROFILE '.local') 'bin') 'python.exe')
+    $candidates += @(Get-Command python -CommandType Application -All -ErrorAction SilentlyContinue | ForEach-Object { $_.Source } | Where-Object { $_ -notlike '*\WindowsApps\*' })
+    foreach ($candidate in $candidates) {
+        if ($candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
+    }
+    return $null
+}
+
+# Deletes the chat keys from a VS Code state.vscdb. PowerShell has no SQLite, so Python's sqlite3
+# does it. Returns the number of deleted keys, or $null when that did not work.
+function Remove-ChatStateKeys($databasePath, $pythonPath) {
+    # One line without double quotes: Windows PowerShell 5.1 passes those to native programs mangled.
+    $pythonCode = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1],timeout=5); n=sum(c.execute('DELETE FROM ItemTable WHERE key LIKE ?',(p,)).rowcount for p in sys.argv[2:]); c.commit(); c.close(); print(n)"
+    $global:LASTEXITCODE = 1
+    $outputLines = @(& $pythonPath -I -c $pythonCode $databasePath @script:VsCodeChatStateKeys 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $outputLines.Count -eq 0) { return $null }
+    return ([string]$outputLines[-1]).Trim()
+}
+
+# Removes the chat history of VS Code and Copilot CLI for this Windows user: the chats of every
+# workspace and outside one, agent sessions, Copilot's memories and the Copilot CLI sessions.
+# Settings, extensions and the GitHub sign-in stay. Returns whether everything is gone.
+function Clear-ChatHistory {
+    Stop-ChatProcesses
+    $leftOver = @()
+    $pythonPath = $null
+    foreach ($product in $script:VsCodeProducts) {
+        $userFolder = Join-Path (Join-Path $env:APPDATA $product) 'User'
+        if (-not (Test-Path -LiteralPath $userFolder)) { continue }
+        # workspaceStorage holds the chats of every folder ever opened, next to that folder's view state.
+        $workspaceStorage = Join-Path $userFolder 'workspaceStorage'
+        foreach ($workspaceFolder in @(Get-ChildItem -LiteralPath $workspaceStorage -Force -ErrorAction SilentlyContinue)) {
+            if (-not (Remove-ChatPath $workspaceFolder.FullName)) { $leftOver += $workspaceFolder.FullName }
+        }
+        $globalStorage = Join-Path $userFolder 'globalStorage'
+        foreach ($chatPath in $script:VsCodeGlobalChatPaths) {
+            $fullPath = Join-Path $globalStorage $chatPath
+            if (-not (Remove-ChatPath $fullPath)) { $leftOver += $fullPath }
+        }
+        $stateDatabase = Join-Path $globalStorage 'state.vscdb'
+        if (Test-Path -LiteralPath $stateDatabase) {
+            if (-not $pythonPath) { $pythonPath = Get-PythonForSqlite }
+            $deletedKeys = if ($pythonPath) { Remove-ChatStateKeys $stateDatabase $pythonPath } else { $null }
+            if ($null -eq $deletedKeys) {
+                Write-Warn "Could not clean the chat list in $stateDatabase$(if (-not $pythonPath) { ' (no Python found)' }). VS Code may still list old chats it can no longer open."
+            }
+            # The backup holds the same keys, and VS Code restores from it after a crash.
+            Remove-Item -LiteralPath "$stateDatabase.backup" -Force -ErrorAction SilentlyContinue
+        }
+        Write-Ok "Removed the chat history of $product."
+    }
+
+    $copilotFolder = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $env:USERPROFILE '.copilot' }
+    if (Test-Path -LiteralPath $copilotFolder) {
+        foreach ($chatPath in $script:CopilotCliChatPaths) {
+            $fullPath = Join-Path $copilotFolder $chatPath
+            if (-not (Remove-ChatPath $fullPath)) { $leftOver += $fullPath }
+        }
+        Write-Ok 'Removed the Copilot CLI sessions.'
+    }
+
+    if ($leftOver.Count -gt 0) {
+        Write-Warn "$($leftOver.Count) chat file(s) are still in use and stay, for example $($leftOver[0]). Close VS Code and press the reset button again for a clean start."
+        return $false
+    }
+    return $true
+}
+
 # Turns -Session values like 1, asr-session-2, "1,2" or all into sessions. Returns $null for an unknown one.
 function Get-SessionsFromNames($sessionNames) {
     $selectedSessions = @()
@@ -382,6 +494,10 @@ function Invoke-Reset {
     }
     Write-Ok "$(& git --version) works."
     Initialize-SystemProxy
+
+    # Every reset starts the next group without chats, also when only one session is reset.
+    Write-Step 'Chat history'
+    Clear-ChatHistory | Out-Null
 
     # --- 3. Sessions -----------------------------------------------------------
     # Every session gets its turn, so one failing session does not block the other.
