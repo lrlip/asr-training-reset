@@ -51,6 +51,9 @@ $script:Shortcuts = @(
 # The single shortcut of an earlier version, which the three above replace.
 $script:OldShortcutName = 'Reset ASR training'
 $script:FallbackTrainingFolder = 'C:\training'
+# The size of the reset window, in characters.
+$script:WindowWidth = 100
+$script:WindowHeight = 25
 # AppLocker and WDAC run scripts from a user folder in ConstrainedLanguage, where .NET calls fail.
 $script:IsFullLanguage = ($ExecutionContext.SessionState.LanguageMode -eq 'FullLanguage')
 $script:ResetExitCode = 0
@@ -123,27 +126,58 @@ function Resolve-TrainingFolder {
     return $null
 }
 
-# A double-click on a desktop shortcut is a reset button. Only creates the shortcuts that are
-# missing, and removes the single shortcut of an earlier version.
+# A double-click on a desktop shortcut is a reset button. Creates the shortcuts that are missing,
+# brings older ones up to date and removes the single shortcut of an earlier version. A shortcut
+# starts its .cmd in the classic console (conhost.exe) instead of Windows Terminal, because only
+# that window can be made smaller.
 function Install-DesktopShortcuts {
     if (-not $script:IsFullLanguage) { return }
     try {
         $desktopFolder = Get-DesktopFolder
         Remove-Item -LiteralPath (Join-Path $desktopFolder "$script:OldShortcutName.lnk") -Force -ErrorAction SilentlyContinue
+        $consoleHost = Join-Path $env:SystemRoot 'System32\conhost.exe'
         $shell = New-Object -ComObject WScript.Shell
         foreach ($shortcutDefinition in $script:Shortcuts) {
             $shortcutPath = Join-Path $desktopFolder "$($shortcutDefinition.Name).lnk"
-            if (Test-Path -LiteralPath $shortcutPath) { continue }
+            $isNewShortcut = -not (Test-Path -LiteralPath $shortcutPath)
+            $cmdFile = Join-Path $PSScriptRoot $shortcutDefinition.Target
+            $targetPath = $cmdFile
+            $arguments = ''
+            if (Test-Path -LiteralPath $consoleHost) {
+                $targetPath = $consoleHost
+                # cmd.exe strips the outer pair of quotes, so a path with spaces keeps its own.
+                $arguments = "cmd.exe /c `"`"$cmdFile`"`""
+            }
             $shortcut = $shell.CreateShortcut($shortcutPath)
-            $shortcut.TargetPath = Join-Path $PSScriptRoot $shortcutDefinition.Target
+            if (-not $isNewShortcut -and $shortcut.TargetPath -ieq $targetPath -and $shortcut.Arguments -eq $arguments) { continue }
+            $shortcut.TargetPath = $targetPath
+            $shortcut.Arguments = $arguments
             $shortcut.WorkingDirectory = $PSScriptRoot
+            $shortcut.IconLocation = "$env:SystemRoot\System32\cmd.exe,0"
             $shortcut.Description = $shortcutDefinition.Description
             $shortcut.Save()
-            Write-Ok "Added the shortcut `"$($shortcutDefinition.Name)`" to the desktop."
+            if ($isNewShortcut) {
+                Write-Ok "Added the shortcut `"$($shortcutDefinition.Name)`" to the desktop."
+            } else {
+                Write-Ok "Updated the shortcut `"$($shortcutDefinition.Name)`" on the desktop."
+            }
         }
     } catch {
         Write-Warn "Could not add the desktop shortcuts: $($_.Exception.Message)"
     }
+}
+
+# Makes the console window small, keeping its scrollback. Only the classic console can be resized;
+# in Windows Terminal this does nothing.
+function Set-SmallWindow {
+    try {
+        $rawUi = $Host.UI.RawUI
+        $windowSize = $rawUi.WindowSize
+        $windowSize.Width = $script:WindowWidth
+        if ($rawUi.BufferSize.Width -lt $windowSize.Width) { $windowSize.Width = $rawUi.BufferSize.Width }
+        $windowSize.Height = $script:WindowHeight
+        $rawUi.WindowSize = $windowSize
+    } catch { }
 }
 
 # Every process, from one snapshot, with its executable path and command line together in Text.
@@ -306,6 +340,7 @@ function Reset-Session($session) {
 }
 
 function Invoke-Reset {
+    Set-SmallWindow
     $resolvedFolder = Resolve-TrainingFolder
     if (-not $resolvedFolder) {
         Write-Info 'Pick a folder you can write to with -TrainingFolder, for example D:\training.'

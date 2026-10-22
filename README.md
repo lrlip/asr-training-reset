@@ -14,8 +14,8 @@ Each button:
 1. Updates this launcher with `git pull --ff-only`. Without a network connection it warns and resets
    with the version on the laptop. Changes to `reset.ps1` count from this run, changes to the `.cmd`
    files from the next one
-2. Asks for confirmation: type `Y`. `reset.cmd` asks which session instead, and that answer is the
-   confirmation
+2. Starts right away: the buttons do not ask for confirmation. `reset.cmd` asks which session to
+   reset, and that answer is the confirmation
 3. Per session: stops the processes that use its folder (node, bun or python running from it, VS
    Code opened on it, and everything they started), removes the folder, clones it again from GitHub
    and runs its `setup.ps1`
@@ -57,9 +57,10 @@ folder and clone it again as above. It holds no work of the participants.
 ## Use
 
 Double-click one of the files in the `asr-training-reset` folder on the desktop once: every run adds
-the three desktop shortcuts that are missing. From then on the shortcuts are the buttons. Between
-two groups: press the one for the session to reset, type `Y`, press Enter and wait until it says
-the session is ready. Anything else than `Y` stops without changing anything.
+the three desktop shortcuts that are missing and brings older ones up to date. From then on the
+shortcuts are the buttons. Between two groups: press the one for the session to reset. It starts
+without asking, in a small window, and the window closes by itself 5 seconds after the session is
+ready. When something goes wrong, the window stays open with the messages.
 
 Resetting deletes all work in the chosen session folders. It does not sign anyone out of GitHub, VS Code
 or Copilot, and does not change the git name and email.
@@ -67,8 +68,7 @@ or Copilot, and does not change the git name and email.
 Options, from a PowerShell window in this folder:
 
 ```powershell
-.\reset1.cmd -Force                         # asr-session-1, no confirmation
-.\resetall.cmd -Force                       # every session, no confirmation
+.\reset.cmd -Session 1                      # asr-session-1, asks for confirmation first
 .\resetall.cmd -TrainingFolder D:\training  # another folder than the desktop (an absolute path)
 ```
 

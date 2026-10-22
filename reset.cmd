@@ -2,7 +2,8 @@
 rem Double-click this file to choose which training sessions to remove, clone again and set up;
 rem reset1.cmd, reset2.cmd and resetall.cmd skip the choice. It first pulls the latest version of
 rem this launcher, then runs reset.ps1 next to it with the execution policy bypassed for this run
-rem only and keeps the window open so the messages stay readable.
+rem only. The window closes by itself after a reset that worked and stays open after one that did
+rem not, so its messages stay readable.
 setlocal
 set "RESET_DIRECTORY=%~dp0"
 set "RESET_SCRIPT=%~dp0reset.ps1"
@@ -42,8 +43,10 @@ rem inside the block have no parentheses: those would end the block.
     pause >nul
     exit /b 1
   )
+  rem After a reset that worked, nothing needs reading: the window closes by itself. One that did
+  rem not finish stays open above, so its messages can be read.
   echo.
-  echo Reset finished. Press any key to close this window.
-  pause >nul
+  echo Reset finished. This window closes in 5 seconds.
+  timeout /t 5 /nobreak >nul
   exit /b 0
 )
